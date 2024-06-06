@@ -18,13 +18,12 @@ except ImportError:
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
-
 class SS2Dv2(nn.Module):
     def __init__(
         self,
         d_model,
         d_state=64,
-        d_conv=4,
+        d_conv=3,
         conv_init=None,
         expand=2,
         headdim=128,
@@ -73,9 +72,9 @@ class SS2Dv2(nn.Module):
         self.conv2d = nn.Conv2d(
             in_channels=conv_dim,
             out_channels=conv_dim,
-            groups=conv_dim,
             bias=conv_bias,
             kernel_size=d_conv,
+            groups=conv_dim,
             padding=(d_conv - 1) // 2,
             **factory_kwargs,
         )
@@ -104,20 +103,21 @@ class SS2Dv2(nn.Module):
         # name.endswith("bias") in param_grouping.py
         self.dt_bias._no_weight_decay = True
 
+        ####### repeat 4?
         # A parameter
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
         A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
         A_log = torch.log(A).to(dtype=dtype)
-        A_log = repeat(A_log, "nheads -> r nheads", r=4)
-        A_log = A_log.flatten(0, 1)
+        #A_log = repeat(A_log, "nheads -> r nheads", r=4)
+        #A_log = A_log.flatten(0, 1)
         self.A_log = nn.Parameter(A_log)
         # self.register_buffer("A_log", torch.zeros(self.nheads, dtype=torch.float32, device=device), persistent=True)
         self.A_log._no_weight_decay = True
 
         # D "skip" parameter
         D = torch.ones(self.nheads, device=device)
-        D = repeat(D, "nheads -> r nheads", r=4)
-        D = D.flatten(0, 1)
+        #D = repeat(D, "nheads -> r nheads", r=4)
+        #D = D.flatten(0, 1)
         self.Ds = nn.Parameter(D)
         self.Ds._no_weight_decay = True
 
@@ -153,11 +153,11 @@ class SS2Dv2(nn.Module):
         As = -torch.exp(self.A_log).view(-1)  # (K * nheads)
         
         out_y = self.mamba_chunk_scan_combined(
-            rearrange(xs, "b l (h p) -> b l h p", p=self.headdim),
+            rearrange(xs, "b l (h p) -> b l h p", p=self.headdim*4),  #headdim=128,nheads=8=d_inner/headdim,K=4,d_inner=1024
             dts,
             As,
-            rearrange(Bs, "b l (g n) -> b l g n", g=self.ngroups),
-            rearrange(Cs, "b l (g n) -> b l g n", g=self.ngroups),
+            rearrange(Bs, "b l (g n) -> b l g n", g=self.ngroups*K),
+            rearrange(Cs, "b l (g n) -> b l g n", g=self.ngroups*K),
             chunk_size=self.chunk_size,
             D=Ds,
             z=None,
@@ -177,13 +177,13 @@ class SS2Dv2(nn.Module):
 
 
     def forward(self, x: torch.Tensor, **kwargs):
-        B, H, W, C = x.shape
+        B, H, W, C = x.shape # [12, 4, 4, 512]
 
-        zxbcdt = self.in_proj(x)  # (B, H, W, d_in_proj)
+        zxbcdt = self.in_proj(x)  # (B, H, W, d_in_proj) [12, 4, 4, 2184]
         
         z, xBC, dt = torch.split(
                 zxbcdt, [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
-            ) # z: (B, H, W, d_inner)
+            ) # z: (B, H, W, d_inner) [12, 4, 4, 1024]
         
         xBC = xBC.permute(0, 3, 1, 2).contiguous()
         xBC = self.act(self.conv2d(xBC)) # (B, conv_dim, H, W)
@@ -196,3 +196,4 @@ class SS2Dv2(nn.Module):
         y = self.norm(y, z)
         out = self.out_proj(y)
         return out
+   
